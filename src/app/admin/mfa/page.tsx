@@ -2,7 +2,7 @@
 
 import { useEffect, useState, Suspense } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
-import { useSession } from "next-auth/react";
+import { useSession, signOut } from "next-auth/react";
 import { AbyvoraLogo } from "@/components/brand/abyvora-logo";
 import { Button } from "@/components/ui/button";
 import { Input, Label } from "@/components/ui/input";
@@ -143,7 +143,11 @@ function PlatformOwnerMfaInner() {
             <div className="grid grid-cols-2 gap-2 mb-5 font-mono text-[12px] p-3 rounded-[10px]" style={{ background: "var(--bg)", color: "var(--text-primary)" }}>
               {recoveryCodes.map((c) => <div key={c}>{c}</div>)}
             </div>
-            <Button className="w-full" onClick={() => router.push(callbackUrl)}>
+            <p className="text-[12px] mb-3" style={{ color: "var(--text-secondary)" }}>
+              For security you will now be signed out. Sign in again and enter the 6-digit code
+              from your authenticator app to finish.
+            </p>
+            <Button className="w-full" onClick={() => signOut({ callbackUrl: "/login" })}>
               I&apos;ve saved these — continue
             </Button>
           </>

@@ -1,0 +1,1400 @@
+// ============================================================================
+// Prisma schema — Agency Management Platform
+// Phase 1 scope: Auth, RBAC, Leads, Clients, Projects, Milestones, Documents,
+// Audit Log, and the foundational tables for Proposals/Commissions/Payments
+// so later phases attach without a schema rewrite.
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Auth & Roles
+// ---------------------------------------------------------------------------
+
+// NOTE ON ROLE ADDITIONS (multi-tenant Platform Owner layer):
+// ADMIN / AGENT / CLIENT / IT_SUPPORT are the pre-existing single-tenant
+// ABYVORA-internal roles and their semantics are UNCHANGED — they continue
+// to mean exactly what they meant before this migration, scoped to the
+// seeded default Organization (see seed.ts) for backward compatibility.
+// The roles below are strictly additive, for the new Platform Owner /
+// multi-tenant Organization layer:
+//   PLATFORM_OWNER — ABYVORA super admin; always organizationId = null;
+//                    the only role with cross-tenant visibility.
+//   ORG_OWNER / ORG_ADMIN / HIGHER_MANAGER / MID_MANAGER / LOWER_MANAGER /
+//   HR / EMPLOYEE — roles that exist *within* a customer Organization's own
+//                    hierarchy. An Organization's own salespeople/clients
+//                    still use the existing AGENT / CLIENT roles, scoped to
+//                    that Organization via organizationId, so we are not
+//                    duplicating those two roles.
+enum Role {
+  ADMIN
+  AGENT
+  CLIENT
+  IT_SUPPORT
+  PLATFORM_OWNER
+  ORG_OWNER
+  ORG_ADMIN
+  HIGHER_MANAGER
+  MID_MANAGER
+  LOWER_MANAGER
+  HR
+  EMPLOYEE
+}
+
+enum UserStatus {
+  ACTIVE
+  DISABLED
+  INVITED
+}
+
+model User {
+  id            String     @id @default(cuid())
+  email         String     @unique
+  passwordHash  String?
+  name          String
+  phone         String?
+  image         String?
+  role          Role
+  status        UserStatus @default(ACTIVE)
+  emailVerified DateTime?
+
+  // Multi-tenant scope. Null = ABYVORA-internal user (Platform Owner,
+  // ABYVORA's own Admin/Agent/IT_SUPPORT rows pre-dating this migration —
+  // see seed.ts backfill). Set for a user that belongs to a customer
+  // Organization. NEVER trust a client-supplied organizationId to set or
+  // compare against this — it is only ever read from the authenticated
+  // session, which is populated from this column server-side.
+  organizationId String?
+  organization   Organization? @relation("OrganizationUsers", fields: [organizationId], references: [id])
+  departmentId   String?
+  department     Department?   @relation(fields: [departmentId], references: [id])
+  managerId      String?
+  manager        User?         @relation("UserManager", fields: [managerId], references: [id])
+  directReports  User[]        @relation("UserManager")
+
+  // MFA (server-enforced; see lib/mfa.ts). Secret is never sent to the client.
+  mfaEnabled      Boolean   @default(false)
+  mfaSecret       String?
+  mfaRecoveryCodes String[] @default([])
+
+  // Role-specific profile rows (only one will be populated based on `role`)
+  agentProfile  Agent?
+  clientProfile Client?
+
+  accounts Account[]
+  sessions Session[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  auditLogs      AuditLog[]      @relation("AuditActor")
+  notifications  Notification[]
+  uploadedDocs   Document[]      @relation("DocumentUploader")
+  emailsCreated  EmailMessage[]  @relation("EmailCreatedBy")
+
+  ticketsRaised        SupportTicket[] @relation("TicketRaisedBy")
+  ticketsAssignedAsIT  SupportTicket[] @relation("TicketAssignedIT")
+  chatMessages         ChatMessage[]
+
+  organizationsApproved Organization[] @relation("OrganizationApprovedBy")
+  orgApprovalsReviewed  OrganizationApproval[] @relation("ApprovalReviewer")
+
+  @@index([role])
+  @@index([status])
+  @@index([organizationId])
+  @@index([departmentId])
+  @@index([managerId])
+}
+
+// NextAuth (Auth.js) required models
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+// ---------------------------------------------------------------------------
+// Agents
+// ---------------------------------------------------------------------------
+
+model Agent {
+  id            String     @id @default(cuid())
+  userId        String     @unique
+  user          User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  designation   String?
+  territories   String[]   @default([])
+  notes         String?    @db.Text
+
+  leads         Lead[]
+  clients       Client[]   @relation("AssignedAgent")
+  projects      Project[]  @relation("AssignedAgentProject")
+
+  proposals        Proposal[]
+  emailThreads     EmailThread[]
+  emailMessages    EmailMessage[]
+  emailDrafts      EmailDraft[]
+  salesActivities  SalesActivity[]
+  tasks            Task[]
+  commissions      Commission[]
+  payments         Payment[]
+
+  ticketsRaised    SupportTicket[] @relation("TicketRaisedByAgent")
+  ticketsAssigned  SupportTicket[] @relation("TicketAssignedAgent")
+  websiteAudits    WebsiteAudit[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// Clients
+// ---------------------------------------------------------------------------
+
+model Client {
+  id                String   @id @default(cuid())
+  organizationId    String?  // null = legacy/ABYVORA-direct client (see seed.ts backfill)
+  organization      Organization? @relation(fields: [organizationId], references: [id])
+  userId            String?  @unique // set once the client has a login
+  user              User?    @relation(fields: [userId], references: [id])
+
+  name              String
+  email             String   @unique
+  phone             String?
+  company           String?
+  country           String?
+  preferredLanguage String   @default("en")
+  city              String?
+  website           String?
+  companyDescription String? @db.Text
+  profileImage      String?
+  emailVerifiedAt   DateTime?
+  termsAcceptedAt   DateTime?
+
+  assignedAgentId String?
+  assignedAgent   Agent?  @relation("AssignedAgent", fields: [assignedAgentId], references: [id])
+
+  leadId String? @unique
+  lead   Lead?   @relation(fields: [leadId], references: [id])
+
+  projects  Project[]
+  documents Document[]
+
+  proposals       Proposal[]
+  emailThreads    EmailThread[]
+  emailMessages   EmailMessage[]
+  salesActivities SalesActivity[]
+  tasks           Task[]
+
+  payments  Payment[]
+  refunds   Refund[]
+  supportTickets SupportTicket[]
+  invoices  Invoice[]
+  websiteAudits WebsiteAudit[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([assignedAgentId])
+  @@index([organizationId])
+}
+
+// ---------------------------------------------------------------------------
+// Leads
+// ---------------------------------------------------------------------------
+
+enum LeadStatus {
+  NEW
+  CONTACTED
+  REPLIED
+  QUALIFIED
+  PROPOSAL_SENT
+  NEGOTIATION
+  WON
+  LOST
+  CONVERTED
+}
+
+model Lead {
+  id       String     @id @default(cuid())
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id])
+  name     String
+  email    String
+  phone    String?
+  company  String?
+  country  String?
+  website  String?
+  industry String?
+  source   String?
+  notes    String?    @db.Text
+  status   LeadStatus @default(NEW)
+  score    Int        @default(0)
+
+  agentId String?
+  agent   Agent?  @relation(fields: [agentId], references: [id])
+
+  convertedClient Client?
+
+  proposals       Proposal[]
+  emailThreads    EmailThread[]
+  emailMessages   EmailMessage[]
+  salesActivities SalesActivity[]
+  tasks           Task[]
+  websiteAudits   WebsiteAudit[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([agentId])
+  @@index([status])
+  @@index([organizationId])
+}
+
+// ---------------------------------------------------------------------------
+// Projects
+// ---------------------------------------------------------------------------
+
+enum ProjectStatus {
+  SUBMITTED
+  NEEDS_INFORMATION
+  PAYMENT_PENDING
+  PAYMENT_RECEIVED
+  WAITING_FOR_REVIEW
+  ACCEPTED
+  REJECTED
+  PLANNING
+  UI_UX
+  DEVELOPMENT
+  TESTING
+  CLIENT_REVIEW
+  ON_HOLD
+  FINAL_DELIVERY
+  COMPLETED
+  CANCELLED
+}
+
+model Project {
+  id          String        @id @default(cuid())
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id])
+  name        String
+  clientId    String
+  client      Client        @relation(fields: [clientId], references: [id])
+
+  assignedAgentId String?
+  assignedAgent   Agent?  @relation("AssignedAgentProject", fields: [assignedAgentId], references: [id])
+
+  projectType    String
+  description    String   @db.Text
+  requirements   String?  @db.Text
+  targetAudience String?
+  deadline       DateTime?
+  budgetEstimate Decimal? @db.Decimal(12, 2)
+  referenceUrls  String[] @default([])
+
+  technologies   String[] @default([])
+
+  totalValue    Decimal? @db.Decimal(12, 2)
+  advanceAmount Decimal? @db.Decimal(12, 2)
+  currency      String   @default("INR")
+
+  status        ProjectStatus @default(SUBMITTED)
+  rejectionReason String?     @db.Text
+  onHoldFromStatus ProjectStatus?
+
+  milestones      Milestone[]
+  documents       Document[]
+  statusHistory   ProjectStatusHistory[]
+  tasks           Task[]
+  payments        Payment[]
+  refunds         Refund[]
+  supportTickets  SupportTicket[]
+  invoices        Invoice[]
+  chatMessages    ChatMessage[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([clientId])
+  @@index([assignedAgentId])
+  @@index([status])
+  @@index([organizationId])
+}
+
+model ProjectStatusHistory {
+  id        String        @id @default(cuid())
+  projectId String
+  project   Project       @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  fromStatus ProjectStatus?
+  toStatus   ProjectStatus
+  changedById String?
+  note       String?      @db.Text
+  createdAt  DateTime     @default(now())
+
+  @@index([projectId])
+}
+
+enum MilestoneStatus {
+  PENDING
+  IN_PROGRESS
+  SUBMITTED_FOR_APPROVAL
+  APPROVED
+  CHANGES_REQUESTED
+  COMPLETED
+}
+
+model Milestone {
+  id          String          @id @default(cuid())
+  projectId   String
+  project     Project         @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  name        String
+  description String?         @db.Text
+  percentage  Int
+  startDate   DateTime?
+  dueDate     DateTime?
+  status      MilestoneStatus @default(PENDING)
+  requiresClientApproval Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([projectId])
+}
+
+// ---------------------------------------------------------------------------
+// Documents (metadata only — binary lives in object storage)
+// ---------------------------------------------------------------------------
+
+enum DocumentType {
+  REQUIREMENT
+  BRAND_ASSET
+  PROPOSAL
+  INVOICE
+  CONTRACT
+  REPORT
+  SOURCE_DELIVERABLE
+  OTHER
+}
+
+model Document {
+  id           String       @id @default(cuid())
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id])
+  filename     String
+  storageKey   String       // key/path in the object storage bucket, never a public URL
+  mimeType     String
+  sizeBytes    Int
+  documentType DocumentType @default(OTHER)
+  version      Int          @default(1)
+
+  projectId String?
+  project   Project? @relation(fields: [projectId], references: [id])
+
+  clientId String?
+  client   Client?  @relation(fields: [clientId], references: [id])
+
+  uploadedById String
+  uploadedBy   User   @relation("DocumentUploader", fields: [uploadedById], references: [id])
+
+  proposals Proposal[]
+  chatAttachments ChatMessage[]
+
+  createdAt DateTime @default(now())
+
+  @@index([projectId])
+  @@index([clientId])
+  @@index([organizationId])
+}
+
+// ---------------------------------------------------------------------------
+// Notifications
+// ---------------------------------------------------------------------------
+
+model Notification {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type      String
+  title     String
+  body      String?  @db.Text
+  read      Boolean  @default(false)
+  readAt    DateTime?
+  metadata  Json?
+  createdAt DateTime @default(now())
+
+  @@index([userId, read])
+  @@index([createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Invoices
+// ---------------------------------------------------------------------------
+
+enum InvoicePaymentStatus {
+  UNPAID
+  PARTIALLY_PAID
+  PAID
+}
+
+model Invoice {
+  id              String   @id @default(cuid())
+  organizationId  String?
+  organization    Organization? @relation(fields: [organizationId], references: [id])
+  invoiceNumber   String   @unique
+  projectId       String
+  project         Project  @relation(fields: [projectId], references: [id])
+  clientId        String
+  client          Client   @relation(fields: [clientId], references: [id])
+  paymentId       String?
+  payment         Payment? @relation(fields: [paymentId], references: [id])
+
+  billingName    String
+  billingAddress String?  @db.Text
+  billingEmail   String
+
+  items    Json // [{ description, quantity, unitPrice }]
+  subtotal Decimal @db.Decimal(12, 2)
+  taxLabel String? // e.g. "GST 18%" — configurable, never invented
+  taxAmount Decimal @default(0) @db.Decimal(12, 2)
+  discount  Decimal @default(0) @db.Decimal(12, 2)
+  total     Decimal @db.Decimal(12, 2)
+  paidAmount Decimal @default(0) @db.Decimal(12, 2)
+  currency  String  @default("INR")
+
+  paymentStatus InvoicePaymentStatus @default(UNPAID)
+  issuedAt      DateTime @default(now())
+  dueAt         DateTime?
+
+  createdById String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([projectId])
+  @@index([clientId])
+  @@index([organizationId])
+}
+
+// ---------------------------------------------------------------------------
+// Private Project Chat
+// ---------------------------------------------------------------------------
+
+model ChatMessage {
+  id         String   @id @default(cuid())
+  projectId  String
+  project    Project  @relation(fields: [projectId], references: [id])
+  senderId   String
+  sender     User     @relation(fields: [senderId], references: [id])
+  senderRole Role
+  message    String   @db.Text
+  isInternal Boolean  @default(false) // Admin/Agent-only note, NEVER shown to Client
+  attachmentDocumentId String?
+  attachmentDocument   Document? @relation(fields: [attachmentDocumentId], references: [id])
+  replyToMessageId String?
+  readByUserIds String[] @default([])
+
+  createdAt DateTime @default(now())
+  editedAt  DateTime?
+  deletedAt DateTime?
+
+  @@index([projectId, createdAt])
+  @@index([isInternal])
+}
+
+// ---------------------------------------------------------------------------
+// Website Audit
+// ---------------------------------------------------------------------------
+
+enum AuditRequestStatus {
+  QUEUED
+  RUNNING
+  COMPLETED
+  FAILED
+}
+
+model WebsiteAudit {
+  id            String   @id @default(cuid())
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id])
+  url           String
+  requestedById String?
+  clientId      String?
+  client        Client?  @relation(fields: [clientId], references: [id])
+  leadId        String?
+  lead          Lead?    @relation(fields: [leadId], references: [id])
+  assignedAgentId String?
+  assignedAgent   Agent? @relation(fields: [assignedAgentId], references: [id])
+
+  status        AuditRequestStatus @default(QUEUED)
+  score         Int?
+  findings      Json?  // structured checks: performance/seo/security/mobile
+  errorMessage  String? @db.Text
+
+  createdAt   DateTime  @default(now())
+  completedAt DateTime?
+
+  @@index([clientId])
+  @@index([leadId])
+  @@index([status])
+  @@index([organizationId])
+}
+
+// ---------------------------------------------------------------------------
+// Audit Log (append-only)
+// ---------------------------------------------------------------------------
+
+enum AuditStatus {
+  SUCCESS
+  FAILED
+}
+
+// Separate from `Role` (which governs login/RBAC) so a webhook or background
+// job can attribute an audit event to "SYSTEM" without that ever being a
+// value User.role can hold.
+// Kept as a strict superset of `Role` (see lib/audit.ts writeAuditLog's cast
+// comment) plus SYSTEM for actor-less events. Any new Role value added
+// above MUST be added here too, or writeAuditLog's cast will attempt to
+// insert a value Postgres's AuditActorRole enum doesn't have.
+enum AuditActorRole {
+  ADMIN
+  AGENT
+  CLIENT
+  IT_SUPPORT
+  PLATFORM_OWNER
+  ORG_OWNER
+  ORG_ADMIN
+  HIGHER_MANAGER
+  MID_MANAGER
+  LOWER_MANAGER
+  HR
+  EMPLOYEE
+  SYSTEM
+}
+
+model AuditLog {
+  id         String      @id @default(cuid())
+  organizationId String?  // scope of the action, if any; null for platform-level events
+  organization   Organization? @relation(fields: [organizationId], references: [id])
+  actorId    String?
+  actor      User?       @relation("AuditActor", fields: [actorId], references: [id])
+  actorRole  AuditActorRole
+  // Denormalized on write so historical rows still show a name/email even if
+  // the User record is later renamed or removed.
+  actorName  String?
+  actorEmail String?
+  action     String
+  entityType String
+  entityId   String?
+  description String?    @db.Text
+  previousValue Json?
+  newValue      Json?
+  status     AuditStatus @default(SUCCESS)
+  errorDetail String?    @db.Text
+  metadata   Json?
+  ipAddress  String?
+  userAgent  String?     @db.Text
+  createdAt  DateTime    @default(now())
+
+  @@index([entityType, entityId])
+  @@index([actorId])
+  @@index([createdAt])
+  @@index([action])
+  @@index([status])
+  @@index([organizationId])
+}
+
+// ---------------------------------------------------------------------------
+// Proposals
+// ---------------------------------------------------------------------------
+
+enum ProposalStatus {
+  DRAFT
+  READY
+  SENT
+  VIEWED
+  ACCEPTED
+  REJECTED
+  CHANGE_REQUESTED
+  EXPIRED
+  CANCELLED
+}
+
+model Proposal {
+  id          String         @id @default(cuid())
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id])
+  title       String
+  agentId     String
+  agent       Agent          @relation(fields: [agentId], references: [id])
+  leadId      String?
+  lead        Lead?          @relation(fields: [leadId], references: [id])
+  clientId    String?
+  client      Client?        @relation(fields: [clientId], references: [id])
+  amount      Decimal?       @db.Decimal(12, 2)
+  currency    String         @default("INR")
+  status      ProposalStatus @default(DRAFT)
+  documentId  String?
+  document    Document?      @relation(fields: [documentId], references: [id])
+  sentAt      DateTime?
+  respondedAt DateTime?
+  version     Int       @default(1)
+  acceptedByUserId  String?
+  acceptedIp        String?
+  acceptedUserAgent String? @db.Text
+
+  emailMessages EmailMessage[]
+  payments      Payment[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([agentId])
+  @@index([leadId])
+  @@index([clientId])
+  @@index([status])
+  @@index([organizationId])
+}
+
+// ---------------------------------------------------------------------------
+// Email system
+// ---------------------------------------------------------------------------
+
+enum EmailType {
+  PROPOSAL
+  SALES
+  GENERAL
+}
+
+enum EmailStatus {
+  DRAFT
+  QUEUED
+  SENDING
+  SENT
+  DELIVERED
+  BOUNCED
+  FAILED
+  REPLIED
+  CANCELLED
+}
+
+enum EmailDirection {
+  OUTBOUND
+  INBOUND
+}
+
+model EmailThread {
+  id            String    @id @default(cuid())
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id])
+  agentId       String
+  agent         Agent     @relation(fields: [agentId], references: [id])
+  clientId      String?
+  client        Client?   @relation(fields: [clientId], references: [id])
+  leadId        String?
+  lead          Lead?     @relation(fields: [leadId], references: [id])
+  subject       String
+  status        String    @default("OPEN")
+  lastMessageAt DateTime?
+
+  messages EmailMessage[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([agentId])
+  @@index([clientId])
+  @@index([leadId])
+  @@index([organizationId])
+}
+
+model EmailMessage {
+  id                String      @id @default(cuid())
+  threadId          String?
+  thread            EmailThread? @relation(fields: [threadId], references: [id])
+  createdByUserId   String
+  createdBy         User        @relation("EmailCreatedBy", fields: [createdByUserId], references: [id])
+  agentId           String
+  agent             Agent       @relation(fields: [agentId], references: [id])
+  emailType         EmailType
+  direction         EmailDirection @default(OUTBOUND)
+  fromEmail         String
+  fromName          String
+  toEmails          String[]
+  ccEmails          String[]    @default([])
+  bccEmails         String[]    @default([])
+  replyTo           String?
+  subject           String
+  htmlBody          String      @db.Text
+  textBody          String?     @db.Text
+  status            EmailStatus @default(DRAFT)
+  readAt            DateTime?
+  important         Boolean     @default(false)
+  archivedAt        DateTime?
+
+  proposalId        String?
+  proposal          Proposal?   @relation(fields: [proposalId], references: [id])
+  leadId            String?
+  lead              Lead?       @relation(fields: [leadId], references: [id])
+  clientId          String?
+  client            Client?     @relation(fields: [clientId], references: [id])
+
+  providerMessageId String?     @unique
+  providerThreadId  String?
+
+  sentAt      DateTime?
+  deliveredAt DateTime?
+  openedAt    DateTime?
+  repliedAt   DateTime?
+  bouncedAt   DateTime?
+  failedAt    DateTime?
+  failureReason String? @db.Text
+
+  attachments EmailAttachment[]
+  events      EmailEvent[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([agentId])
+  @@index([clientId])
+  @@index([leadId])
+  @@index([emailType])
+  @@index([status])
+  @@index([createdAt])
+  @@index([threadId])
+}
+
+model EmailAttachment {
+  id                   String       @id @default(cuid())
+  emailMessageId       String
+  emailMessage         EmailMessage @relation(fields: [emailMessageId], references: [id], onDelete: Cascade)
+  fileName             String
+  storageKey           String
+  mimeType             String
+  size                 Int
+  providerAttachmentId String?
+
+  createdAt DateTime @default(now())
+
+  @@index([emailMessageId])
+}
+
+model EmailEvent {
+  id              String       @id @default(cuid())
+  emailMessageId  String
+  emailMessage    EmailMessage @relation(fields: [emailMessageId], references: [id], onDelete: Cascade)
+  eventType       String
+  providerEventId String?      @unique
+  metadata        Json?
+  occurredAt      DateTime
+  createdAt       DateTime     @default(now())
+
+  @@index([emailMessageId])
+  @@index([eventType])
+}
+
+model EmailDraft {
+  id        String    @id @default(cuid())
+  agentId   String
+  agent     Agent     @relation(fields: [agentId], references: [id])
+  emailType EmailType
+  toEmails  String[]  @default([])
+  ccEmails  String[]  @default([])
+  bccEmails String[]  @default([])
+  subject   String?
+  htmlBody  String?   @db.Text
+  textBody  String?   @db.Text
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([agentId])
+}
+
+model SuppressedRecipient {
+  email     String   @id
+  reason    String
+  createdAt DateTime @default(now())
+}
+
+// ---------------------------------------------------------------------------
+// Sales activity & follow-ups
+// ---------------------------------------------------------------------------
+
+enum SalesActivityType {
+  INITIAL_OUTREACH
+  FOLLOW_UP
+  DEMO_REQUEST
+  MEETING_REQUEST
+  PROPOSAL_REQUEST
+  NEGOTIATION
+  WON
+  LOST
+  NOT_INTERESTED
+  NO_RESPONSE
+}
+
+model SalesActivity {
+  id             String            @id @default(cuid())
+  agentId        String
+  agent          Agent             @relation(fields: [agentId], references: [id])
+  leadId         String?
+  lead           Lead?             @relation(fields: [leadId], references: [id])
+  clientId       String?
+  client         Client?           @relation(fields: [clientId], references: [id])
+  emailMessageId String?
+  activityType   SalesActivityType
+  notes          String?           @db.Text
+  nextFollowUpAt DateTime?
+  status         String            @default("OPEN")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([agentId])
+  @@index([leadId])
+  @@index([clientId])
+}
+
+enum TaskStatus {
+  PENDING
+  COMPLETED
+  CANCELLED
+}
+
+enum TaskPriority {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+model Task {
+  id          String       @id @default(cuid())
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id])
+  agentId     String
+  agent       Agent        @relation(fields: [agentId], references: [id])
+  title       String
+  notes       String?      @db.Text
+  leadId      String?
+  lead        Lead?        @relation(fields: [leadId], references: [id])
+  clientId    String?
+  client      Client?      @relation(fields: [clientId], references: [id])
+  projectId   String?
+  project     Project?     @relation(fields: [projectId], references: [id])
+  dueAt       DateTime?
+  priority    TaskPriority @default(MEDIUM)
+  status      TaskStatus   @default(PENDING)
+  completedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([agentId])
+  @@index([status])
+  @@index([dueAt])
+  @@index([organizationId])
+}
+
+// ---------------------------------------------------------------------------
+// Commissions
+// ---------------------------------------------------------------------------
+
+enum CommissionStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  PAID
+  REVERSED
+}
+
+model CommissionRule {
+  id          String   @id @default(cuid())
+  name        String
+  sourceType  String // e.g. "PROPOSAL_ACCEPTED", "PROJECT_PAID"
+  percentage  Decimal? @db.Decimal(5, 2)
+  flatAmount  Decimal? @db.Decimal(12, 2)
+  active      Boolean  @default(true)
+
+  commissions Commission[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Commission {
+  id                 String            @id @default(cuid())
+  organizationId     String?
+  organization       Organization?     @relation(fields: [organizationId], references: [id])
+  agentId            String
+  agent              Agent             @relation(fields: [agentId], references: [id])
+  sourceType         String
+  sourceId           String
+  commissionRuleId   String?
+  commissionRule     CommissionRule?   @relation(fields: [commissionRuleId], references: [id])
+  amount             Decimal           @db.Decimal(12, 2)
+  currency           String            @default("INR")
+  status             CommissionStatus  @default(PENDING)
+  calculationSnapshot Json?
+  idempotencyKey     String            @unique
+  reversalReason     String?           @db.Text
+
+  approvedAt DateTime?
+  paidAt     DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([agentId])
+  @@index([status])
+  @@index([sourceType, sourceId])
+  @@index([organizationId])
+}
+
+// ---------------------------------------------------------------------------
+// Settings (single-row key/value platform config, e.g. commission defaults)
+// ---------------------------------------------------------------------------
+
+model Setting {
+  key       String   @id
+  value     Json
+  updatedAt DateTime @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// IT Support
+// ---------------------------------------------------------------------------
+
+enum SupportCategory {
+  LOGIN_AND_AUTHENTICATION
+  ACCOUNT_ACCESS
+  PROJECT_PORTAL
+  PAYMENT_TECHNICAL_ISSUE
+  DOCUMENT_UPLOAD_DOWNLOAD
+  PROJECT_CHAT
+  NOTIFICATIONS
+  WEBSITE_AUDIT
+  WEBSITE_ERROR
+  PERFORMANCE
+  BUG_REPORT
+  SECURITY_CONCERN
+  OTHER
+}
+
+enum SupportPriority {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+enum SupportTicketStatus {
+  SUBMITTED
+  ADMIN_REVIEW
+  NEEDS_INFORMATION
+  ADMIN_ASSIGNED
+  ASSIGNED_TO_AGENT
+  AGENT_IN_PROGRESS
+  ESCALATED_TO_ADMIN
+  ESCALATION_REJECTED
+  FORWARDED_TO_IT
+  IT_ASSIGNED
+  IT_IN_PROGRESS
+  WAITING_FOR_USER
+  RESOLVED
+  CLOSED
+  REOPENED
+  CANCELLED
+}
+
+enum EstimateUnit {
+  MINUTES
+  HOURS
+  DAYS
+}
+
+model SupportTicket {
+  id          String              @id @default(cuid())
+  organizationId String?
+  organization   Organization?    @relation(fields: [organizationId], references: [id])
+  ticketNumber String             @unique
+  title        String
+  description  String             @db.Text
+  category     SupportCategory
+  subcategory  String?
+
+  raisedById   String
+  raisedBy     User               @relation("TicketRaisedBy", fields: [raisedById], references: [id])
+  raisedByRole Role
+
+  clientId  String?
+  client    Client?  @relation(fields: [clientId], references: [id])
+  agentId   String?
+  agent     Agent?   @relation("TicketRaisedByAgent", fields: [agentId], references: [id])
+
+  relatedProjectId String?
+  relatedProject   Project? @relation(fields: [relatedProjectId], references: [id])
+  relatedPaymentId String?
+  relatedPayment   Payment? @relation(fields: [relatedPaymentId], references: [id])
+
+  assignedAgentId     String?
+  assignedAgent       Agent?  @relation("TicketAssignedAgent", fields: [assignedAgentId], references: [id])
+  assignedITSupportId String?
+  assignedITSupport   User?   @relation("TicketAssignedIT", fields: [assignedITSupportId], references: [id])
+
+  priority           SupportPriority @default(MEDIUM)
+  status             SupportTicketStatus @default(SUBMITTED)
+
+  escalationReason      String? @db.Text
+  adminDecisionReason   String? @db.Text
+  resolutionSummary     String? @db.Text
+
+  estimateValue String?
+  estimateUnit  EstimateUnit?
+  estimateNote  String? @db.Text
+  estimateSetAt DateTime?
+
+  messages   SupportTicketMessage[]
+  activities SupportTicketActivity[]
+
+  closedAt  DateTime?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([raisedById])
+  @@index([clientId])
+  @@index([agentId])
+  @@index([assignedAgentId])
+  @@index([assignedITSupportId])
+  @@index([status])
+  @@index([priority])
+  @@index([organizationId])
+}
+
+model SupportTicketMessage {
+  id          String        @id @default(cuid())
+  ticketId    String
+  ticket      SupportTicket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  senderId    String
+  senderRole  Role
+  message     String        @db.Text
+  isInternal  Boolean       @default(false)
+  createdAt   DateTime      @default(now())
+
+  @@index([ticketId])
+}
+
+model SupportTicketActivity {
+  id                  String        @id @default(cuid())
+  ticketId            String
+  ticket              SupportTicket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  actorId             String?
+  actorRole           AuditActorRole
+  action              String
+  previousStatus      SupportTicketStatus?
+  newStatus           SupportTicketStatus?
+  previousPriority    SupportPriority?
+  newPriority         SupportPriority?
+  note                String?  @db.Text
+  metadata            Json?
+  createdAt           DateTime @default(now())
+
+  @@index([ticketId])
+}
+
+
+// ---------------------------------------------------------------------------
+// Payments
+// ---------------------------------------------------------------------------
+
+enum PaymentStatus {
+  CREATED
+  PENDING
+  AUTHORIZED
+  CAPTURED
+  FAILED
+  CANCELLED
+  REFUND_PENDING
+  PARTIALLY_REFUNDED
+  REFUNDED
+}
+
+model Payment {
+  id                String        @id @default(cuid())
+  organizationId    String?
+  organization      Organization? @relation(fields: [organizationId], references: [id])
+  projectId         String
+  project           Project       @relation(fields: [projectId], references: [id])
+  proposalId        String?
+  proposal          Proposal?     @relation(fields: [proposalId], references: [id])
+  clientId          String
+  client            Client        @relation(fields: [clientId], references: [id])
+  agentId           String?
+  agent             Agent?        @relation(fields: [agentId], references: [id])
+
+  provider          String        @default("razorpay")
+  providerOrderId   String?       @unique
+  providerPaymentId String?       @unique
+  providerSignature String?
+
+  amount            Decimal       @db.Decimal(12, 2)
+  currency          String        @default("INR")
+  status            PaymentStatus @default(CREATED)
+  paymentMethod     String?
+  receipt           String?       @unique
+  failureReason     String?       @db.Text
+  metadata          Json?
+
+  refunds           Refund[]
+  supportTickets    SupportTicket[]
+  invoices          Invoice[]
+
+  paidAt    DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  @@index([projectId])
+  @@index([clientId])
+  @@index([status])
+  @@index([organizationId])
+}
+
+// ---------------------------------------------------------------------------
+// Refunds
+// ---------------------------------------------------------------------------
+
+enum RefundStatus {
+  NOT_REQUESTED
+  REQUESTED
+  PROCESSING
+  INITIATED
+  PROCESSED
+  FAILED
+  CANCELLED
+  REJECTED
+}
+
+model Refund {
+  id                 String       @id @default(cuid())
+  organizationId     String?
+  organization       Organization? @relation(fields: [organizationId], references: [id])
+  projectId          String
+  project            Project      @relation(fields: [projectId], references: [id])
+  paymentId          String
+  payment            Payment      @relation(fields: [paymentId], references: [id])
+  clientId           String
+  client             Client       @relation(fields: [clientId], references: [id])
+
+  requestedById      String
+  approvedById       String?
+
+  provider           String       @default("razorpay")
+  providerPaymentId  String?
+  providerRefundId   String?      @unique
+
+  amount             Decimal      @db.Decimal(12, 2)
+  currency           String       @default("INR")
+  reason             String       @db.Text
+  status             RefundStatus @default(REQUESTED)
+  failureReason      String?      @db.Text
+  rejectionReason    String?      @db.Text
+  idempotencyKey     String       @unique
+
+  requestedAt DateTime  @default(now())
+  processedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([projectId])
+  @@index([paymentId])
+  @@index([clientId])
+  @@index([status])
+  @@index([organizationId])
+}
+
+
+// ============================================================================
+// Platform Owner / Multi-Tenant layer (additive — see migration notes at the
+// top of this file under `enum Role`). Every model below is new; nothing
+// existing was removed or renamed.
+// ============================================================================
+
+enum OrganizationStatus {
+  PENDING_REVIEW   // submitted, awaiting Platform Owner review
+  CHANGES_REQUESTED
+  APPROVED         // approved but not yet activated (e.g. awaiting first payment)
+  ACTIVE
+  GRACE_PERIOD
+  SUSPENDED
+  TERMINATED
+  REJECTED
+}
+
+enum SubscriptionAccessStatus {
+  ACTIVE
+  PAYMENT_DUE
+  GRACE_PERIOD
+  SUSPENDED
+  TERMINATED
+}
+
+enum OrganizationApprovalDecision {
+  APPROVED
+  REJECTED
+  CHANGES_REQUESTED
+}
+
+model Organization {
+  id          String             @id @default(cuid())
+  name        String
+  legalName   String?
+  slug        String             @unique
+  industry    String?
+  website     String?
+  contactEmail String?
+  contactPhone String?
+  status      OrganizationStatus @default(PENDING_REVIEW)
+
+  ownerId     String?
+  // Deliberately no relation() back-reference to User here to avoid a
+  // circular required relation at the DB level — ownership is resolved via
+  // the Organization -> User.organizationId + User.role == ORG_OWNER query,
+  // not a hard FK, since the owner's User row itself belongs to this org.
+
+  approvedById String?
+  approvedBy   User?   @relation("OrganizationApprovedBy", fields: [approvedById], references: [id])
+  approvedAt   DateTime?
+  rejectedReason String? @db.Text
+
+  planId      String?
+  plan        SubscriptionPlan? @relation(fields: [planId], references: [id])
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  users            User[]                 @relation("OrganizationUsers")
+  clients          Client[]
+  leads            Lead[]
+  projects         Project[]
+  payments         Payment[]
+  invoices         Invoice[]
+  refunds          Refund[]
+  supportTickets   SupportTicket[]
+  proposals        Proposal[]
+  tasks            Task[]
+  commissions      Commission[]
+  emailThreads     EmailThread[]
+  documents        Document[]
+  websiteAudits    WebsiteAudit[]
+  auditLogs        AuditLog[]
+  departments      Department[]
+  subscription     OrganizationSubscription?
+  approvals        OrganizationApproval[]
+
+  @@index([status])
+  @@index([slug])
+  @@index([planId])
+}
+
+model SubscriptionPlan {
+  id            String   @id @default(cuid())
+  name          String
+  slug          String   @unique
+  priceMonthly  Decimal  @db.Decimal(12, 2)
+  priceYearly   Decimal? @db.Decimal(12, 2)
+  currency      String   @default("INR")
+  // Feature entitlements as structured JSON, e.g. { "maxUsers": 25, "aiEnabled": true }.
+  // Enforced server-side wherever a gated feature is checked — never trust
+  // the client's view of which plan is active.
+  features      Json     @default("{}")
+  active        Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  organizations          Organization[]
+  organizationSubscriptions OrganizationSubscription[]
+
+  @@index([active])
+}
+
+model OrganizationSubscription {
+  id                 String                    @id @default(cuid())
+  organizationId     String                    @unique
+  organization       Organization              @relation(fields: [organizationId], references: [id])
+  planId             String
+  plan               SubscriptionPlan          @relation(fields: [planId], references: [id])
+  status             SubscriptionAccessStatus  @default(ACTIVE)
+  currentPeriodStart DateTime                  @default(now())
+  currentPeriodEnd   DateTime
+  gracePeriodEndsAt  DateTime?
+  cancelAtPeriodEnd  Boolean                   @default(false)
+  createdAt          DateTime                  @default(now())
+  updatedAt          DateTime                  @updatedAt
+
+  @@index([status])
+  @@index([planId])
+}
+
+// ABYVORA-internal departments have organizationId = null (e.g. "Customer
+// Support", "Technical Support" on the Platform Owner dashboard). A
+// customer Organization's own departments set organizationId to scope them.
+model Department {
+  id             String   @id @default(cuid())
+  organizationId String?
+  organization   Organization? @relation(fields: [organizationId], references: [id])
+  name           String
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  members User[]
+
+  @@index([organizationId])
+}
+
+model OrganizationApproval {
+  id             String                       @id @default(cuid())
+  organizationId String
+  organization   Organization                 @relation(fields: [organizationId], references: [id])
+  reviewerId     String
+  reviewer       User                         @relation("ApprovalReviewer", fields: [reviewerId], references: [id])
+  decision       OrganizationApprovalDecision
+  reason         String?                      @db.Text
+  createdAt      DateTime                     @default(now())
+
+  @@index([organizationId])
+  @@index([reviewerId])
+}
